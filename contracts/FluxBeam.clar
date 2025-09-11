@@ -1,6 +1,6 @@
 ;; FluxBeam - Streaming Micropayments Across the Stacks Continuum
-;; Version: 1.0.0
-;; Enables real-time, per-second micropayments using smart contracts
+;; Version: 1.1.0
+;; Enables real-time, per-second micropayments using smart contracts with batch processing
 
 ;; Constants
 (define-constant ERR-NOT-AUTHORIZED (err u1))
@@ -13,10 +13,16 @@
 (define-constant ERR-INVALID-DURATION (err u8))
 (define-constant ERR-SERVICE-NOT-FOUND (err u9))
 (define-constant ERR-INVALID-NAME (err u10))
+(define-constant ERR-BATCH-LIMIT-EXCEEDED (err u11))
+(define-constant ERR-EMPTY-BATCH (err u12))
+(define-constant ERR-BATCH-PROCESSING-FAILED (err u13))
+
+(define-constant MAX-BATCH-SIZE u50)
 
 ;; Data variables
 (define-data-var next-session-id uint u1)
 (define-data-var next-service-id uint u1)
+(define-data-var next-batch-id uint u1)
 (define-data-var contract-owner principal tx-sender)
 
 ;; Data maps
@@ -24,8 +30,8 @@
     uint
     {
         provider: principal,
-        service-name: (string-utf8 50),
-        rate-per-second: uint,
+        service_name: (string-utf8 50),
+        rate_per_second: uint,
         status: (string-utf8 15)
     }
 )
@@ -34,17 +40,34 @@
     uint
     {
         user: principal,
-        service-id: uint,
-        start-time: uint,
-        end-time: uint,
-        rate-per-second: uint,
-        total-deposited: uint,
-        total-consumed: uint,
-        status: (string-utf8 15)
+        service_id: uint,
+        start_time: uint,
+        end_time: uint,
+        rate_per_second: uint,
+        total_deposited: uint,
+        total_consumed: uint,
+        status: (string-utf8 15),
+        batch_id: (optional uint)
     }
 )
 
 (define-map user-balances principal uint)
+
+(define-map batch-settlements
+    uint
+    {
+        provider: principal,
+        session_count: uint,
+        total_amount: uint,
+        processed: bool,
+        created_at: uint
+    }
+)
+
+(define-map pending-batch-sessions
+    {batch_id: uint, session_index: uint}
+    uint
+)
 
 ;; Private functions
 (define-private (validate-service-name (name (string-utf8 50)))
@@ -62,6 +85,42 @@
     stacks-block-height
 )
 
+(define-private (validate-batch-size (size uint))
+    (and (> size u0) (<= size MAX-BATCH-SIZE))
+)
+
+(define-private (process-single-batch-session (session-id uint) (provider principal) (batch-total uint))
+    (let
+        (
+            (session (unwrap! (map-get? payment-sessions session-id) (err u0)))
+            (current-time (get-current-time))
+            (session-duration (- current-time (get start_time session)))
+            (actual-cost (calculate-session-cost session-duration (get rate_per_second session)))
+            (deposited-amount (get total_deposited session))
+            (refund-amount (if (> deposited-amount actual-cost) (- deposited-amount actual-cost) u0))
+            (user-balance (default-to u0 (map-get? user-balances (get user session))))
+        )
+        ;; Validate session can be processed
+        (asserts! (is-eq (get status session) u"active") (err u0))
+        (asserts! (is-eq (get service_id session) (get service_id session)) (ok u0))
+        
+        ;; Update session status
+        (map-set payment-sessions session-id (merge session {
+            end_time: current-time,
+            total_consumed: actual-cost,
+            status: u"completed"
+        }))
+        
+        ;; Handle refund if any
+        (if (> refund-amount u0)
+            (map-set user-balances (get user session) (+ user-balance refund-amount))
+            true
+        )
+        
+        (ok actual-cost)
+    )
+)
+
 ;; Public functions
 
 ;; Register a new service
@@ -75,8 +134,8 @@
         
         (map-set services service-id {
             provider: tx-sender,
-            service-name: service-name,
-            rate-per-second: rate-per-second,
+            service_name: service-name,
+            rate_per_second: rate-per-second,
             status: u"active"
         })
         
@@ -105,7 +164,7 @@
         (
             (session-id (var-get next-session-id))
             (service (unwrap! (map-get? services service-id) ERR-SERVICE-NOT-FOUND))
-            (rate (get rate-per-second service))
+            (rate (get rate_per_second service))
             (estimated-cost (calculate-session-cost estimated-duration rate))
             (user-balance (default-to u0 (map-get? user-balances tx-sender)))
             (current-time (get-current-time))
@@ -116,13 +175,14 @@
         
         (map-set payment-sessions session-id {
             user: tx-sender,
-            service-id: service-id,
-            start-time: current-time,
-            end-time: u0,
-            rate-per-second: rate,
-            total-deposited: estimated-cost,
-            total-consumed: u0,
-            status: u"active"
+            service_id: service-id,
+            start_time: current-time,
+            end_time: u0,
+            rate_per_second: rate,
+            total_deposited: estimated-cost,
+            total_consumed: u0,
+            status: u"active",
+            batch_id: none
         })
         
         (map-set user-balances tx-sender (- user-balance estimated-cost))
@@ -136,11 +196,11 @@
     (let
         (
             (session (unwrap! (map-get? payment-sessions session-id) ERR-SESSION-NOT-FOUND))
-            (service (unwrap! (map-get? services (get service-id session)) ERR-SERVICE-NOT-FOUND))
+            (service (unwrap! (map-get? services (get service_id session)) ERR-SERVICE-NOT-FOUND))
             (current-time (get-current-time))
-            (session-duration (- current-time (get start-time session)))
-            (actual-cost (calculate-session-cost session-duration (get rate-per-second session)))
-            (deposited-amount (get total-deposited session))
+            (session-duration (- current-time (get start_time session)))
+            (actual-cost (calculate-session-cost session-duration (get rate_per_second session)))
+            (deposited-amount (get total_deposited session))
             (refund-amount (if (> deposited-amount actual-cost) (- deposited-amount actual-cost) u0))
             (provider (get provider service))
             (user-balance (default-to u0 (map-get? user-balances (get user session))))
@@ -150,9 +210,10 @@
         
         ;; Update session status
         (map-set payment-sessions session-id (merge session {
-            end-time: current-time,
-            total-consumed: actual-cost,
-            status: u"completed"
+            end_time: current-time,
+            total_consumed: actual-cost,
+            status: u"completed",
+            batch_id: none
         }))
         
         ;; Transfer payment to service provider
@@ -168,10 +229,73 @@
         )
         
         (ok {
-            session-duration: session-duration,
-            actual-cost: actual-cost,
-            refund-amount: refund-amount
+            session_duration: session-duration,
+            actual_cost: actual-cost,
+            refund_amount: refund-amount
         })
+    )
+)
+
+;; Process multiple sessions in a batch for cost efficiency
+(define-public (process-batch-sessions (session-ids (list 50 uint)))
+    (let
+        (
+            (batch-id (var-get next-batch-id))
+            (session-count (len session-ids))
+            (first-session (unwrap! (element-at session-ids u0) ERR-EMPTY-BATCH))
+            (session (unwrap! (map-get? payment-sessions first-session) ERR-SESSION-NOT-FOUND))
+            (service (unwrap! (map-get? services (get service_id session)) ERR-SERVICE-NOT-FOUND))
+            (provider (get provider service))
+        )
+        (asserts! (validate-batch-size session-count) ERR-BATCH-LIMIT-EXCEEDED)
+        (asserts! (> session-count u0) ERR-EMPTY-BATCH)
+        
+        ;; Process each session in the batch
+        (let
+            (
+                (batch-result (fold process-batch-session session-ids {total: u0, success: true, processed: u0}))
+            )
+            (asserts! (get success batch-result) ERR-BATCH-PROCESSING-FAILED)
+            
+            ;; Create batch settlement record
+            (map-set batch-settlements batch-id {
+                provider: provider,
+                session_count: (get processed batch-result),
+                total_amount: (get total batch-result),
+                processed: false,
+                created_at: (get-current-time)
+            })
+            
+            ;; Transfer batch payment to provider
+            (if (> (get total batch-result) u0)
+                (try! (as-contract (stx-transfer? (get total batch-result) tx-sender provider)))
+                true
+            )
+            
+            ;; Mark batch as processed
+            (map-set batch-settlements batch-id (merge (unwrap-panic (map-get? batch-settlements batch-id)) {processed: true}))
+            
+            (var-set next-batch-id (+ batch-id u1))
+            (ok {
+                batch_id: batch-id,
+                sessions_processed: (get processed batch-result),
+                total_amount: (get total batch-result)
+            })
+        )
+    )
+)
+
+;; Helper function for batch processing fold operation
+(define-private (process-batch-session (session-id uint) (acc {total: uint, success: bool, processed: uint}))
+    (if (get success acc)
+        (match (process-single-batch-session session-id tx-sender (get total acc))
+            session-cost (merge acc {
+                total: (+ (get total acc) session-cost),
+                processed: (+ (get processed acc) u1)
+            })
+            error-val (merge acc {success: false})
+        )
+        acc
     )
 )
 
@@ -225,9 +349,36 @@
     (let
         (
             (service (unwrap! (map-get? services service-id) ERR-SERVICE-NOT-FOUND))
-            (rate (get rate-per-second service))
+            (rate (get rate_per_second service))
         )
         (ok (calculate-session-cost duration rate))
+    )
+)
+
+;; Get batch settlement details
+(define-read-only (get-batch-settlement (batch-id uint))
+    (map-get? batch-settlements batch-id)
+)
+
+;; Estimate batch processing savings
+(define-read-only (estimate-batch-savings (session-count uint))
+    (let
+        (
+            (individual-gas-cost u1000) ;; Estimated gas per individual transaction
+            (batch-gas-cost u2000) ;; Estimated gas for batch transaction
+            (total-individual-cost (* session-count individual-gas-cost))
+            (savings (if (> total-individual-cost batch-gas-cost) 
+                        (- total-individual-cost batch-gas-cost) 
+                        u0))
+        )
+        (ok {
+            individual_cost: total-individual-cost,
+            batch_cost: batch-gas-cost,
+            savings: savings,
+            savings_percentage: (if (> total-individual-cost u0) 
+                                   (/ (* savings u100) total-individual-cost) 
+                                   u0)
+        })
     )
 )
 
