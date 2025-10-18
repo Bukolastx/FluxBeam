@@ -2,11 +2,14 @@
 
 **Streaming Micropayments Across the Stacks Continuum**
 
-FluxBeam enables real-time, per-second micropayments using smart contracts on the Stacks blockchain. Perfect for time-based access to APIs, streaming content, and remote work billing.
+FluxBeam enables real-time, per-second micropayments and flexible subscription models using smart contracts on the Stacks blockchain. Perfect for time-based access to APIs, streaming content, SaaS services, and remote work billing.
 
 ## Features
 
 - **Real-time Micropayments**: Pay per second of service usage
+- **Subscription Models**: 🆕 Recurring payments with tiered pricing structures
+- **Auto-Renewal**: 🆕 Automatic subscription renewals with grace periods
+- **Tiered Pricing**: 🆕 Multiple subscription tiers per service with custom features
 - **Batch Payment Processing**: Process multiple sessions in a single transaction to reduce costs
 - **Smart Contract Automation**: Automated payment release and refunds
 - **Service Registration**: Providers can register services with custom rates
@@ -17,6 +20,7 @@ FluxBeam enables real-time, per-second micropayments using smart contracts on th
 
 ## How It Works
 
+### Pay-Per-Use Model
 1. **Service Providers** register their services with per-second rates
 2. **Users** deposit STX tokens into their FluxBeam balance
 3. **Sessions** are started with estimated duration and automatic escrow
@@ -24,129 +28,77 @@ FluxBeam enables real-time, per-second micropayments using smart contracts on th
 5. **Batch processing** allows multiple sessions to be settled in one transaction
 6. **Automatic settlement** pays providers and refunds excess to users
 
+### Subscription Model 🆕
+1. **Service Providers** create subscription tiers with custom pricing and durations
+2. **Users** subscribe to tiers with one-time or auto-renewing payments
+3. **Automatic billing** handles renewals when auto-renew is enabled
+4. **Flexible management** allows users to cancel or toggle auto-renewal anytime
+5. **Grace periods** enable renewals up to 1 day before expiration
+6. **Tiered access** provides different feature levels at various price points
+
 ## Smart Contract Functions
 
 ### Public Functions
 
+#### Service Management
 - `register-service(service-name, rate-per-second)` - Register a new service
+- `update-service-status(service-id, status)` - Enable/disable services
+
+#### Subscription Functions 🆕
+- `create-subscription-tier(service-id, tier-name, price, duration-blocks, features)` - Create a subscription tier
+- `subscribe(tier-id, auto-renew)` - Subscribe to a service tier
+- `renew-subscription(subscription-id)` - Manually renew an active subscription
+- `cancel-subscription(subscription-id)` - Cancel a subscription (no refund)
+- `toggle-auto-renew(subscription-id)` - Enable/disable automatic renewal
+- `update-tier-status(tier-id, status)` - Activate/deactivate a subscription tier
+
+#### Payment & Session Functions
 - `deposit-funds(amount)` - Add STX to your FluxBeam balance
 - `start-session(service-id, estimated-duration)` - Begin a metered session
 - `end-session(session-id)` - Stop session and calculate final payment
-- `process-batch-sessions(session-ids)` - **NEW**: Process up to 50 sessions in one transaction
+- `process-batch-sessions(session-ids)` - Process up to 50 sessions in one transaction
 - `withdraw-balance(amount)` - Withdraw unused STX from balance
-- `update-service-status(service-id, status)` - Enable/disable services
 
 ### Read-Only Functions
 
+#### Service Queries
 - `get-service(service-id)` - View service details
 - `get-session(session-id)` - View session information
-- `get-user-balance(user)` - Check user's FluxBeam balance
 - `estimate-session-cost(service-id, duration)` - Calculate estimated costs
-- `get-batch-settlement(batch-id)` - **NEW**: View batch settlement details
-- `estimate-batch-savings(session-count)` - **NEW**: Calculate potential gas savings
 
-## Batch Payment Processing
+#### Subscription Queries 🆕
+- `get-tier(tier-id)` - View subscription tier details
+- `get-subscription(subscription-id)` - View subscription information
+- `get-user-subscription(user, service-id)` - Get user's subscription for a service
+- `has-active-subscription(user, service-id)` - Check if user has active subscription
+- `get-subscription-status(subscription-id)` - Get detailed subscription status with time remaining
 
-### Benefits
-- **Reduced Gas Costs**: Process up to 50 sessions in a single transaction
-- **Improved Efficiency**: Lower overhead for high-frequency service usage
-- **Bulk Operations**: Ideal for services with many short sessions
-- **Cost Savings**: Significant gas fee reduction for providers and users
+#### Balance & Analytics
+- `get-user-balance(user)` - Check user's FluxBeam balance
+- `get-batch-settlement(batch-id)` - View batch settlement details
+- `estimate-batch-savings(session-count)` - Calculate potential gas savings
 
-### Usage
+## Subscription System
+
+### Creating Subscription Tiers
+
+Service providers can create multiple tiers for their services:
+
 ```clarity
-;; Process multiple sessions at once
-(process-batch-sessions (list u1 u2 u3 u4 u5))
-```
+;; Create a monthly Basic tier
+(create-subscription-tier 
+    u1                              ;; service-id
+    u"Basic"                        ;; tier-name
+    u1000000                        ;; price (1 STX in micro-STX)
+    u4320                           ;; duration (30 days in blocks)
+    u"100 API calls/day, Email support"  ;; features
+)
 
-### Batch Limits
-- Maximum 50 sessions per batch
-- All sessions must be active and ready for settlement
-- Automatic refund handling for each session
-- Single payment to service provider
-
-## Use Cases
-
-- **API Access**: Pay per API call or data transfer with batch settlements
-- **Streaming Content**: Per-second billing for video/audio streams
-- **Remote Work**: Time-based billing for development or consulting
-- **IoT Services**: Metered access to sensor data or device control
-- **Cloud Resources**: Pay-per-use infrastructure services with cost optimization
-- **Micro-SaaS**: Efficient billing for small, frequent service usage
-
-## Getting Started
-
-1. Deploy the FluxBeam contract to Stacks
-2. Register your service using `register-service`
-3. Users deposit funds with `deposit-funds`
-4. Start sessions with `start-session`
-5. Use `process-batch-sessions` for cost-efficient bulk settlements
-6. Monitor usage and end individual sessions with `end-session`
-
-## Gas Cost Optimization
-
-### Individual Processing
-- Each session settlement requires a separate transaction
-- Higher cumulative gas costs for multiple sessions
-- Suitable for single or few sessions
-
-### Batch Processing
-- Process up to 50 sessions in one transaction
-- Significant gas savings (typically 60-80% reduction)
-- Automatic cost calculation and settlement
-- Built-in error handling and refund processing
-
-## Security Features
-
-- Input validation on all parameters
-- Authorization checks for service management
-- Automatic refunds for unused deposits
-- Protected balance withdrawals
-- Session state management
-- Batch size limits to prevent abuse
-- Comprehensive error handling for batch operations
-
-## Technical Implementation
-
-Built with Clarity smart contracts on Stacks blockchain, ensuring:
-- Deterministic execution
-- Bitcoin-level security
-- Transparent and auditable code
-- Gas-efficient operations
-- Optimized batch processing algorithms
-- Proper error handling and data validation
-
-## Error Codes
-
-- `ERR-BATCH-LIMIT-EXCEEDED (u11)`: Batch size exceeds maximum limit
-- `ERR-EMPTY-BATCH (u12)`: No sessions provided for batch processing
-- `ERR-BATCH-PROCESSING-FAILED (u13)`: Batch operation failed during processing
-
-## Version History
-
-### v1.1.0 - Batch Payment Processing
-- Added `process-batch-sessions` function for bulk settlements
-- Implemented batch settlement tracking and analytics
-- Added gas cost estimation for batch vs individual processing
-- Enhanced error handling for batch operations
-- Improved contract efficiency and cost optimization
-
-### v1.0.0 - Initial Release
-- Core micropayment functionality
-- Service registration and management
-- Session-based billing system
-- Real-time payment processing
-
-## Future Roadmap
-
-- **Advanced Analytics**: Detailed usage and cost analytics dashboard
-- **Subscription Models**: Recurring payment options for long-term services
-- **Dispute Resolution**: Automated dispute handling mechanisms
-- **Multi-token Support**: Support for additional cryptocurrencies
-- **Integration APIs**: RESTful APIs for easier service integration
-
----
-
-**Version**: 1.1.0  
-**Blockchain**: Stacks  
-**Language**: Clarity
+;; Create a Premium tier
+(create-subscription-tier 
+    u1 
+    u"Premium" 
+    u5000000 
+    u4320 
+    u"Unlimited API calls, Priority support, Advanced analytics"
+)
