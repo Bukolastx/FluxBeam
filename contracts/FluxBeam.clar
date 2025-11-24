@@ -1,6 +1,7 @@
 ;; FluxBeam - Streaming Micropayments Across the Stacks Continuum
-;; Version: 1.2.0
+;; Version: 1.3.0
 ;; Enables real-time, per-second micropayments and subscription models with batch processing
+;; New: Service analytics and usage tracking
 
 ;; Constants
 (define-constant ERR-NOT-AUTHORIZED (err u1))
@@ -113,6 +114,29 @@
     uint
 )
 
+;; NEW: Service analytics tracking
+(define-map service-analytics
+    uint
+    {
+        total-sessions: uint,
+        total-revenue: uint,
+        total-subscribers: uint,
+        active-subscribers: uint,
+        last-activity-block: uint
+    }
+)
+
+;; NEW: User activity tracking
+(define-map user-activity
+    principal
+    {
+        total-sessions: uint,
+        total-spent: uint,
+        active-subscriptions: uint,
+        last-activity-block: uint
+    }
+)
+
 ;; Private functions
 (define-private (validate-service-name (name (string-utf8 50)))
     (and 
@@ -182,6 +206,58 @@
     )
 )
 
+;; NEW: Update service analytics
+(define-private (update-service-analytics (service-id uint) (revenue uint) (is-subscription bool))
+    (let
+        (
+            (current-analytics (default-to 
+                {
+                    total-sessions: u0,
+                    total-revenue: u0,
+                    total-subscribers: u0,
+                    active-subscribers: u0,
+                    last-activity-block: u0
+                } 
+                (map-get? service-analytics service-id)))
+            (current-block stacks-block-height)
+        )
+        (map-set service-analytics service-id {
+            total-sessions: (+ (get total-sessions current-analytics) u1),
+            total-revenue: (+ (get total-revenue current-analytics) revenue),
+            total-subscribers: (if is-subscription 
+                                  (+ (get total-subscribers current-analytics) u1) 
+                                  (get total-subscribers current-analytics)),
+            active-subscribers: (get active-subscribers current-analytics),
+            last-activity-block: current-block
+        })
+    )
+)
+
+;; NEW: Update user activity
+(define-private (update-user-activity (user principal) (amount uint) (is-subscription bool))
+    (let
+        (
+            (current-activity (default-to 
+                {
+                    total-sessions: u0,
+                    total-spent: u0,
+                    active-subscriptions: u0,
+                    last-activity-block: u0
+                } 
+                (map-get? user-activity user)))
+            (current-block stacks-block-height)
+        )
+        (map-set user-activity user {
+            total-sessions: (+ (get total-sessions current-activity) u1),
+            total-spent: (+ (get total-spent current-activity) amount),
+            active-subscriptions: (if is-subscription 
+                                     (+ (get active-subscriptions current-activity) u1) 
+                                     (get active-subscriptions current-activity)),
+            last-activity-block: current-block
+        })
+    )
+)
+
 ;; Public functions
 
 ;; Register a new service
@@ -199,6 +275,15 @@
             rate-per-second: rate-per-second,
             status: u"active",
             subscription-enabled: false
+        })
+        
+        ;; Initialize analytics for new service
+        (map-set service-analytics service-id {
+            total-sessions: u0,
+            total-revenue: u0,
+            total-subscribers: u0,
+            active-subscribers: u0,
+            last-activity-block: stacks-block-height
         })
         
         (var-set next-service-id (+ service-id u1))
@@ -273,6 +358,10 @@
         
         (map-set user-balances tx-sender (- user-balance price))
         
+        ;; Update analytics
+        (update-service-analytics service-id price true)
+        (update-user-activity tx-sender price true)
+        
         (try! (as-contract (stx-transfer? price tx-sender (get provider service))))
         
         (var-set next-subscription-id (+ subscription-id u1))
@@ -312,6 +401,10 @@
             }))
             
             (map-set user-balances tx-sender (- user-balance price))
+            
+            ;; Update analytics
+            (update-service-analytics service-id price false)
+            (update-user-activity tx-sender price false)
             
             (try! (as-contract (stx-transfer? price tx-sender (get provider service))))
             
@@ -435,6 +528,10 @@
             status: u"completed",
             batch-id: none
         }))
+        
+        ;; Update analytics
+        (update-service-analytics (get service-id session) actual-cost false)
+        (update-user-activity tx-sender actual-cost false)
         
         (if (> actual-cost u0)
             (try! (as-contract (stx-transfer? actual-cost tx-sender provider)))
@@ -648,6 +745,45 @@
                 })
             )
         ERR-SUBSCRIPTION-NOT-FOUND
+    )
+)
+
+;; NEW: Get service analytics
+(define-read-only (get-service-analytics (service-id uint))
+    (ok (map-get? service-analytics service-id))
+)
+
+;; NEW: Get user activity statistics
+(define-read-only (get-user-activity (user principal))
+    (ok (map-get? user-activity user))
+)
+
+;; NEW: Get service performance metrics
+(define-read-only (get-service-metrics (service-id uint))
+    (match (map-get? service-analytics service-id)
+        analytics
+            (match (map-get? services service-id)
+                service
+                    (let
+                        (
+                            (avg-session-revenue (if (> (get total-sessions analytics) u0)
+                                                    (/ (get total-revenue analytics) (get total-sessions analytics))
+                                                    u0))
+                        )
+                        (ok {
+                            service-name: (get service-name service),
+                            total-sessions: (get total-sessions analytics),
+                            total-revenue: (get total-revenue analytics),
+                            total-subscribers: (get total-subscribers analytics),
+                            active-subscribers: (get active-subscribers analytics),
+                            avg-session-revenue: avg-session-revenue,
+                            last-activity-block: (get last-activity-block analytics),
+                            is-active: (is-eq (get status service) u"active")
+                        })
+                    )
+                ERR-SERVICE-NOT-FOUND
+            )
+        ERR-SERVICE-NOT-FOUND
     )
 )
 
