@@ -1,7 +1,7 @@
 ;; FluxBeam - Streaming Micropayments Across the Stacks Continuum
-;; Version: 1.3.0
+;; Version: 1.4.0
 ;; Enables real-time, per-second micropayments and subscription models with batch processing
-;; New: Service analytics and usage tracking
+;; New v1.4.0: Emergency pause system, provider withdrawal, and rate limiting
 
 ;; Constants
 (define-constant ERR-NOT-AUTHORIZED (err u1))
@@ -24,10 +24,14 @@
 (define-constant ERR-TIER-NOT-FOUND (err u18))
 (define-constant ERR-RENEWAL-TOO-EARLY (err u19))
 (define-constant ERR-INVALID-PERIOD (err u20))
+(define-constant ERR-CONTRACT-PAUSED (err u21))
+(define-constant ERR-NO-PENDING-EARNINGS (err u22))
+(define-constant ERR-RATE-LIMIT-EXCEEDED (err u23))
 
 (define-constant MAX-BATCH-SIZE u50)
 (define-constant BLOCKS-PER-DAY u144)
 (define-constant BLOCKS-PER-MONTH u4320)
+(define-constant RATE-LIMIT-BLOCKS u6)
 
 ;; Data variables
 (define-data-var next-session-id uint u1)
@@ -36,6 +40,7 @@
 (define-data-var next-subscription-id uint u1)
 (define-data-var next-tier-id uint u1)
 (define-data-var contract-owner principal tx-sender)
+(define-data-var contract-paused bool false)
 
 ;; Data maps
 (define-map services
@@ -114,7 +119,6 @@
     uint
 )
 
-;; NEW: Service analytics tracking
 (define-map service-analytics
     uint
     {
@@ -126,7 +130,6 @@
     }
 )
 
-;; NEW: User activity tracking
 (define-map user-activity
     principal
     {
@@ -134,6 +137,26 @@
         total-spent: uint,
         active-subscriptions: uint,
         last-activity-block: uint
+    }
+)
+
+;; NEW v1.4.0: Provider earnings tracking
+(define-map provider-earnings
+    principal
+    {
+        total-earned: uint,
+        pending-withdrawal: uint,
+        last-withdrawal-block: uint,
+        total-withdrawn: uint
+    }
+)
+
+;; NEW v1.4.0: Rate limiting for session creation
+(define-map user-rate-limits
+    principal
+    {
+        last-session-block: uint,
+        sessions-in-window: uint
     }
 )
 
@@ -206,7 +229,6 @@
     )
 )
 
-;; NEW: Update service analytics
 (define-private (update-service-analytics (service-id uint) (revenue uint) (is-subscription bool))
     (let
         (
@@ -233,7 +255,6 @@
     )
 )
 
-;; NEW: Update user activity
 (define-private (update-user-activity (user principal) (amount uint) (is-subscription bool))
     (let
         (
@@ -258,14 +279,104 @@
     )
 )
 
+;; NEW v1.4.0: Update provider earnings
+(define-private (update-provider-earnings (provider principal) (amount uint))
+    (let
+        (
+            (current-earnings (default-to 
+                {
+                    total-earned: u0,
+                    pending-withdrawal: u0,
+                    last-withdrawal-block: u0,
+                    total-withdrawn: u0
+                } 
+                (map-get? provider-earnings provider)))
+        )
+        (map-set provider-earnings provider {
+            total-earned: (+ (get total-earned current-earnings) amount),
+            pending-withdrawal: (+ (get pending-withdrawal current-earnings) amount),
+            last-withdrawal-block: (get last-withdrawal-block current-earnings),
+            total-withdrawn: (get total-withdrawn current-earnings)
+        })
+    )
+)
+
+;; NEW v1.4.0: Check rate limit
+(define-private (check-rate-limit (user principal))
+    (let
+        (
+            (current-block stacks-block-height)
+            (rate-limit-data (default-to 
+                {
+                    last-session-block: u0,
+                    sessions-in-window: u0
+                } 
+                (map-get? user-rate-limits user)))
+            (last-block (get last-session-block rate-limit-data))
+            (blocks-passed (if (> current-block last-block) (- current-block last-block) u0))
+        )
+        (if (>= blocks-passed RATE-LIMIT-BLOCKS)
+            (begin
+                (map-set user-rate-limits user {
+                    last-session-block: current-block,
+                    sessions-in-window: u1
+                })
+                (ok true)
+            )
+            (let
+                (
+                    (sessions-count (get sessions-in-window rate-limit-data))
+                )
+                (asserts! (< sessions-count u10) ERR-RATE-LIMIT-EXCEEDED)
+                (map-set user-rate-limits user {
+                    last-session-block: last-block,
+                    sessions-in-window: (+ sessions-count u1)
+                })
+                (ok true)
+            )
+        )
+    )
+)
+
 ;; Public functions
 
-;; Register a new service
+;; NEW v1.4.0: Emergency pause toggle (owner only)
+(define-public (toggle-contract-pause)
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (var-set contract-paused (not (var-get contract-paused)))
+        (ok (var-get contract-paused))
+    )
+)
+
+;; NEW v1.4.0: Provider withdrawal function
+(define-public (withdraw-provider-earnings)
+    (let
+        (
+            (earnings-data (unwrap! (map-get? provider-earnings tx-sender) ERR-NO-PENDING-EARNINGS))
+            (pending-amount (get pending-withdrawal earnings-data))
+            (current-block stacks-block-height)
+        )
+        (asserts! (> pending-amount u0) ERR-NO-PENDING-EARNINGS)
+        
+        (map-set provider-earnings tx-sender {
+            total-earned: (get total-earned earnings-data),
+            pending-withdrawal: u0,
+            last-withdrawal-block: current-block,
+            total-withdrawn: (+ (get total-withdrawn earnings-data) pending-amount)
+        })
+        
+        (try! (as-contract (stx-transfer? pending-amount tx-sender tx-sender)))
+        (ok pending-amount)
+    )
+)
+
 (define-public (register-service (service-name (string-utf8 50)) (rate-per-second uint))
     (let
         (
             (service-id (var-get next-service-id))
         )
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
         (asserts! (validate-service-name service-name) ERR-INVALID-NAME)
         (asserts! (> rate-per-second u0) ERR-INVALID-RATE)
         
@@ -277,7 +388,6 @@
             subscription-enabled: false
         })
         
-        ;; Initialize analytics for new service
         (map-set service-analytics service-id {
             total-sessions: u0,
             total-revenue: u0,
@@ -291,7 +401,6 @@
     )
 )
 
-;; Create a subscription tier for a service
 (define-public (create-subscription-tier 
     (service-id uint) 
     (tier-name (string-utf8 30)) 
@@ -303,6 +412,7 @@
             (tier-id (var-get next-tier-id))
             (service (unwrap! (map-get? services service-id) ERR-SERVICE-NOT-FOUND))
         )
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
         (asserts! (is-eq tx-sender (get provider service)) ERR-NOT-AUTHORIZED)
         (asserts! (validate-tier-name tier-name) ERR-INVALID-NAME)
         (asserts! (> price u0) ERR-INVALID-AMOUNT)
@@ -324,7 +434,6 @@
     )
 )
 
-;; Subscribe to a service tier
 (define-public (subscribe (tier-id uint) (auto-renew bool))
     (let
         (
@@ -337,7 +446,9 @@
             (user-balance (default-to u0 (map-get? user-balances tx-sender)))
             (current-block stacks-block-height)
             (end-block (+ current-block duration))
+            (provider (get provider service))
         )
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
         (asserts! (is-eq (get status tier) u"active") ERR-TIER-NOT-FOUND)
         (asserts! (is-eq (get status service) u"active") ERR-SERVICE-NOT-FOUND)
         (asserts! (>= user-balance price) ERR-INSUFFICIENT-BALANCE)
@@ -358,18 +469,17 @@
         
         (map-set user-balances tx-sender (- user-balance price))
         
-        ;; Update analytics
         (update-service-analytics service-id price true)
         (update-user-activity tx-sender price true)
+        (update-provider-earnings provider price)
         
-        (try! (as-contract (stx-transfer? price tx-sender (get provider service))))
+        (try! (as-contract (stx-transfer? price tx-sender provider)))
         
         (var-set next-subscription-id (+ subscription-id u1))
         (ok subscription-id)
     )
 )
 
-;; Renew a subscription
 (define-public (renew-subscription (subscription-id uint))
     (let
         (
@@ -384,7 +494,9 @@
             (current-block stacks-block-height)
             (grace-period u144)
             (can-renew (>= current-block (- (get end-block subscription) grace-period)))
+            (provider (get provider service))
         )
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
         (asserts! (is-eq tx-sender (get user subscription)) ERR-NOT-AUTHORIZED)
         (asserts! can-renew ERR-RENEWAL-TOO-EARLY)
         (asserts! (>= user-balance price) ERR-INSUFFICIENT-BALANCE)
@@ -402,18 +514,17 @@
             
             (map-set user-balances tx-sender (- user-balance price))
             
-            ;; Update analytics
             (update-service-analytics service-id price false)
             (update-user-activity tx-sender price false)
+            (update-provider-earnings provider price)
             
-            (try! (as-contract (stx-transfer? price tx-sender (get provider service))))
+            (try! (as-contract (stx-transfer? price tx-sender provider)))
             
             (ok new-end-block)
         )
     )
 )
 
-;; Cancel a subscription
 (define-public (cancel-subscription (subscription-id uint))
     (let
         (
@@ -429,7 +540,6 @@
     )
 )
 
-;; Toggle auto-renewal for a subscription
 (define-public (toggle-auto-renew (subscription-id uint))
     (let
         (
@@ -444,7 +554,6 @@
     )
 )
 
-;; Update subscription tier status
 (define-public (update-tier-status (tier-id uint) (new-status (string-utf8 15)))
     (let
         (
@@ -458,12 +567,12 @@
     )
 )
 
-;; Deposit funds to user balance
 (define-public (deposit-funds (amount uint))
     (let
         (
             (current-balance (default-to u0 (map-get? user-balances tx-sender)))
         )
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
         
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
@@ -472,7 +581,6 @@
     )
 )
 
-;; Start a new payment session
 (define-public (start-session (service-id uint) (estimated-duration uint))
     (let
         (
@@ -483,6 +591,8 @@
             (user-balance (default-to u0 (map-get? user-balances tx-sender)))
             (current-time (get-current-time))
         )
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+        (try! (check-rate-limit tx-sender))
         (asserts! (> estimated-duration u0) ERR-INVALID-DURATION)
         (asserts! (is-eq (get status service) u"active") ERR-SERVICE-NOT-FOUND)
         (asserts! (>= user-balance estimated-cost) ERR-INSUFFICIENT-BALANCE)
@@ -505,7 +615,6 @@
     )
 )
 
-;; End a payment session and calculate final payment
 (define-public (end-session (session-id uint))
     (let
         (
@@ -529,9 +638,9 @@
             batch-id: none
         }))
         
-        ;; Update analytics
         (update-service-analytics (get service-id session) actual-cost false)
         (update-user-activity tx-sender actual-cost false)
+        (update-provider-earnings provider actual-cost)
         
         (if (> actual-cost u0)
             (try! (as-contract (stx-transfer? actual-cost tx-sender provider)))
@@ -551,7 +660,6 @@
     )
 )
 
-;; Process multiple sessions in a batch for cost efficiency
 (define-public (process-batch-sessions (session-ids (list 50 uint)))
     (let
         (
@@ -562,6 +670,7 @@
             (service (unwrap! (map-get? services (get service-id first-session)) ERR-SERVICE-NOT-FOUND))
             (provider (get provider service))
         )
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
         (asserts! (validate-batch-size session-count) ERR-BATCH-LIMIT-EXCEEDED)
         (asserts! (> session-count u0) ERR-EMPTY-BATCH)
         
@@ -578,6 +687,8 @@
                 processed: false,
                 created-at: (get-current-time)
             })
+            
+            (update-provider-earnings provider (get total batch-result))
             
             (if (> (get total batch-result) u0)
                 (try! (as-contract (stx-transfer? (get total batch-result) tx-sender provider)))
@@ -598,7 +709,6 @@
     )
 )
 
-;; Helper function for batch processing fold operation
 (define-private (process-batch-session (session-id uint) (acc {total: uint, success: bool, processed: uint}))
     (if (get success acc)
         (match (process-single-batch-session session-id tx-sender (get total acc))
@@ -612,7 +722,6 @@
     )
 )
 
-;; Withdraw user balance
 (define-public (withdraw-balance (amount uint))
     (let
         (
@@ -627,7 +736,6 @@
     )
 )
 
-;; Update service status
 (define-public (update-service-status (service-id uint) (new-status (string-utf8 15)))
     (let
         (
@@ -642,27 +750,26 @@
 
 ;; Read-only functions
 
-;; Get service details
+(define-read-only (get-contract-paused)
+    (ok (var-get contract-paused))
+)
+
 (define-read-only (get-service (service-id uint))
-    (map-get? services service-id)
+    (ok (map-get? services service-id))
 )
 
-;; Get subscription tier details
 (define-read-only (get-tier (tier-id uint))
-    (map-get? subscription-tiers tier-id)
+    (ok (map-get? subscription-tiers tier-id))
 )
 
-;; Get subscription details
 (define-read-only (get-subscription (subscription-id uint))
-    (map-get? subscriptions subscription-id)
+    (ok (map-get? subscriptions subscription-id))
 )
 
-;; Get user's active subscription for a service
 (define-read-only (get-user-subscription (user principal) (service-id uint))
-    (map-get? user-subscriptions {user: user, service-id: service-id})
+    (ok (map-get? user-subscriptions {user: user, service-id: service-id}))
 )
 
-;; Check if user has active subscription
 (define-read-only (has-active-subscription (user principal) (service-id uint))
     (match (map-get? user-subscriptions {user: user, service-id: service-id})
         sub-id (is-subscription-valid sub-id)
@@ -670,17 +777,14 @@
     )
 )
 
-;; Get payment session details
 (define-read-only (get-session (session-id uint))
-    (map-get? payment-sessions session-id)
+    (ok (map-get? payment-sessions session-id))
 )
 
-;; Get user balance
 (define-read-only (get-user-balance (user principal))
-    (default-to u0 (map-get? user-balances user))
+    (ok (default-to u0 (map-get? user-balances user)))
 )
 
-;; Calculate estimated cost for a session
 (define-read-only (estimate-session-cost (service-id uint) (duration uint))
     (match (map-get? services service-id)
         service
@@ -694,12 +798,10 @@
     )
 )
 
-;; Get batch settlement details
 (define-read-only (get-batch-settlement (batch-id uint))
-    (map-get? batch-settlements batch-id)
+    (ok (map-get? batch-settlements batch-id))
 )
 
-;; Estimate batch processing savings
 (define-read-only (estimate-batch-savings (session-count uint))
     (let
         (
@@ -721,7 +823,6 @@
     )
 )
 
-;; Get subscription status and time remaining
 (define-read-only (get-subscription-status (subscription-id uint))
     (match (map-get? subscriptions subscription-id)
         subscription
@@ -748,17 +849,14 @@
     )
 )
 
-;; NEW: Get service analytics
 (define-read-only (get-service-analytics (service-id uint))
     (ok (map-get? service-analytics service-id))
 )
 
-;; NEW: Get user activity statistics
 (define-read-only (get-user-activity (user principal))
     (ok (map-get? user-activity user))
 )
 
-;; NEW: Get service performance metrics
 (define-read-only (get-service-metrics (service-id uint))
     (match (map-get? service-analytics service-id)
         analytics
@@ -787,7 +885,31 @@
     )
 )
 
-;; Get active sessions for a user
-(define-read-only (get-user-active-sessions (user principal))
-    (ok user)
+;; NEW v1.4.0: Get provider earnings
+(define-read-only (get-provider-earnings (provider principal))
+    (ok (map-get? provider-earnings provider))
+)
+
+;; NEW v1.4.0: Get user rate limit status
+(define-read-only (get-rate-limit-status (user principal))
+    (let
+        (
+            (rate-limit-data (default-to 
+                {
+                    last-session-block: u0,
+                    sessions-in-window: u0
+                } 
+                (map-get? user-rate-limits user)))
+            (current-block stacks-block-height)
+            (last-block (get last-session-block rate-limit-data))
+            (blocks-passed (if (> current-block last-block) (- current-block last-block) u0))
+            (is-limited (and (< blocks-passed RATE-LIMIT-BLOCKS) (>= (get sessions-in-window rate-limit-data) u10)))
+        )
+        (ok {
+            is-rate-limited: is-limited,
+            sessions-in-window: (get sessions-in-window rate-limit-data),
+            blocks-until-reset: (if (< blocks-passed RATE-LIMIT-BLOCKS) (- RATE-LIMIT-BLOCKS blocks-passed) u0),
+            last-session-block: last-block
+        })
+    )
 )
